@@ -235,16 +235,6 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
 def get_rows(payload: GetRowsRequest, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
 
-    return {
-        "sheet_name": payload.sheet_name,
-        "rows": get_values(payload.sheet_name)
-    }
-
-
-@app.post("/get-rows")
-def get_rows(payload: GetRowsRequest, x_api_key: str = Header(...)):
-    check_api_key(x_api_key)
-
     if payload.sheet_name == LOG_SHEET_NAME:
         rows = rows_from_log_sheet()
     else:
