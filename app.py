@@ -379,32 +379,55 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
 
     service = get_sheets_service()
 
-    values = []
+    # Read live headers from Master Leads
+    values = get_sheet_values(MASTER_SHEET_NAME)
+    if not values:
+        raise HTTPException(status_code=404, detail="Master sheet is empty or header row missing")
+
+    headers = values[0]
+
+    # Canonical field -> live sheet header mapping
+    field_map = {
+        "lead_name": "Lead Name",
+        "company": "Company",
+        "source": "Source",
+        "stage_status": "Stage",
+        "last_touchpoint_summary": "Last Touchpoint",
+        "follow_up_date": "Follow-up Date",
+        "notes": "Notes",
+        "missing_fields_declared": "Missing Fields",
+    }
+
+    rows_to_add = []
+
     for lead in payload.leads:
-        values.append([
-            "",
-            lead.lead_name,
-            lead.company or "",
-            lead.source or "",
-            lead.owner or "",
-            lead.stage_status or "",
-            lead.last_touchpoint_date or "",
-            lead.last_touchpoint_summary or "",
-            lead.follow_up_date or "",
-            lead.requirement_interest or "",
-            lead.notes or "",
-            lead.missing_fields_declared or "",
-        ])
+        row_dict = {header: "" for header in headers}
+
+        # Only map known business fields
+        for attr, target_header in field_map.items():
+            if target_header in row_dict:
+                value = getattr(lead, attr, None)
+                row_dict[target_header] = value if value is not None else ""
+
+        # Optional workflow defaults
+        if "Handover Status" in row_dict and row_dict["Handover Status"] == "":
+            row_dict["Handover Status"] = "Pending"
+
+        # Let formula/system columns remain blank unless explicitly controlled elsewhere
+        # Example: Lead ID, Lead Age (Days), Feedback Alert, Handover Gate
+
+        ordered_row = [row_dict.get(header, "") for header in headers]
+        rows_to_add.append(ordered_row)
 
     service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{MASTER_SHEET_NAME}!A:L",
+        range=f"{MASTER_SHEET_NAME}!A:Z",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={"values": values},
+        body={"values": rows_to_add},
     ).execute()
 
-    return {"status": "success", "rows_added": len(values)}
+    return {"status": "success", "rows_added": len(rows_to_add)}
 
 
 @app.post("/get-rows")
