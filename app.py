@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
-app = FastAPI(title="Sales Handoff API", version="6.1.0")
+app = FastAPI(title="Sales Handoff API", version="6.2.0")
 
 APP_API_KEY = os.getenv("APP_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
@@ -19,11 +19,9 @@ LOG_SHEET_NAME = os.getenv("LOG_SHEET_NAME", "Update Log")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Master Leads layout
 HEADER_ROW = 3
 DATA_START_ROW = 4
 
-# Update Log layout
 LOG_HEADER_ROW = 1
 LOG_DATA_START_ROW = 2
 
@@ -53,7 +51,7 @@ def root():
     return {
         "status": "running",
         "message": "Sales Handoff API is live",
-        "version": "6.1.0",
+        "version": "6.2.0",
         "available_endpoints": {
             "health": "GET /",
             "docs": "GET /docs",
@@ -615,6 +613,21 @@ def next_lead_id(existing_rows: List[Dict[str, Any]]) -> str:
     return f"L{max_number + 1:03d}"
 
 
+def find_next_empty_master_row(existing_rows: List[Dict[str, Any]]) -> int:
+    last_occupied_row = DATA_START_ROW - 1
+
+    for row in existing_rows:
+        lead_id = first_value(row, ["Lead ID", "Lead_ID"])
+        lead_name = first_value(row, ["Lead Name", "Lead Name ✱", "Lead_Name"])
+
+        if lead_id or lead_name:
+            row_number = row.get("_row_number")
+            if row_number and row_number > last_occupied_row:
+                last_occupied_row = row_number
+
+    return last_occupied_row + 1
+
+
 def build_notes(lead: LeadRecord) -> str:
     parts = []
 
@@ -640,47 +653,50 @@ def build_notes(lead: LeadRecord) -> str:
 
 
 def copy_formula_cells(service, sheet_name: str, headers: List[str], previous_row: int, new_row: int):
-    formula_headers = [
-        "Missing Fields",
-        "Lead Age (Days)",
-        "Feedback Alert",
-        "✔ Handover Gate",
-    ]
+    try:
+        formula_headers = [
+            "Missing Fields",
+            "Lead Age (Days)",
+            "Feedback Alert",
+            "✔ Handover Gate",
+        ]
 
-    header_index = get_header_index_map(headers)
-    previous_formulas = get_row_values(sheet_name, previous_row, headers, value_render_option="FORMULA")
+        header_index = get_header_index_map(headers)
+        previous_formulas = get_row_values(sheet_name, previous_row, headers, value_render_option="FORMULA")
 
-    if not previous_formulas:
-        return
+        if not previous_formulas:
+            return
 
-    updates = []
+        updates = []
 
-    for header in formula_headers:
-        key = normalize_header(header)
-        if key not in header_index:
-            continue
+        for header in formula_headers:
+            key = normalize_header(header)
+            if key not in header_index:
+                continue
 
-        index = header_index[key]
-        if index >= len(previous_formulas):
-            continue
+            index = header_index[key]
+            if index >= len(previous_formulas):
+                continue
 
-        formula_value = previous_formulas[index]
+            formula_value = previous_formulas[index]
 
-        if isinstance(formula_value, str) and formula_value.startswith("="):
-            col_letter = col_to_letter(index + 1)
-            updates.append({
-                "range": f"{sheet_name}!{col_letter}{new_row}",
-                "values": [[formula_value]],
-            })
+            if isinstance(formula_value, str) and formula_value.startswith("="):
+                col_letter = col_to_letter(index + 1)
+                updates.append({
+                    "range": f"{sheet_name}!{col_letter}{new_row}",
+                    "values": [[formula_value]],
+                })
 
-    if updates:
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={
-                "valueInputOption": "USER_ENTERED",
-                "data": updates,
-            },
-        ).execute()
+        if updates:
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": updates,
+                },
+            ).execute()
+    except Exception as exc:
+        print("FORMULA COPY ERROR:", str(exc))
 
 
 # -----------------------------
@@ -877,7 +893,7 @@ def build_email_draft(review_data: Dict[str, Any]) -> str:
 def sheet_schema(x_api_key: str = Header(...)):
     check_api_key(x_api_key)
 
-    headers = get_headers(MASTER_SHEET_NAME)
+    sheet_headers = get_headers(MASTER_SHEET_NAME)
 
     return {
         "spreadsheet_id": SPREADSHEET_ID,
@@ -891,7 +907,7 @@ def sheet_schema(x_api_key: str = Header(...)):
         ],
         "header_row": HEADER_ROW,
         "data_start_row": DATA_START_ROW,
-        "columns": headers,
+        "columns": sheet_headers,
     }
 
 
@@ -905,89 +921,107 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
     if len(values) < HEADER_ROW:
         raise HTTPException(status_code=404, detail="Master sheet header row not found")
 
-    headers = values[HEADER_ROW - 1]
-    header_index = get_header_index_map(headers)
+    sheet_headers = values[HEADER_ROW - 1]
+    header_index = get_header_index_map(sheet_headers)
     existing_rows = rows_from_sheet(MASTER_SHEET_NAME)
 
     inserted = []
 
     for lead in payload.leads:
-        row_dict = {header: "" for header in headers}
-
-        if "leadid" in header_index:
-            row_dict[headers[header_index["leadid"]]] = next_lead_id(existing_rows)
-
-        mapping = {
-            "leadname": lead.lead_name,
+        next_row_number = find_next_empty_master_row(existing_rows)
+        row_updates = []
+        inserted_item = {
+            "row_number": next_row_number,
+            "lead_id": "",
+            "lead_name": lead.lead_name,
             "company": lead.company or "",
             "source": normalize_source(lead.source),
             "stage": lead.stage_status or "",
-            "lasttouchpoint": lead.last_touchpoint_date or "",
-            "followupdate": lead.follow_up_date or "",
+            "last_touchpoint": lead.last_touchpoint_date or "",
+            "follow_up_date": lead.follow_up_date or "",
             "notes": build_notes(lead),
         }
 
-        for normalized_header, value in mapping.items():
-            if normalized_header in header_index:
-                actual_header = headers[header_index[normalized_header]]
-                row_dict[actual_header] = value
+        def add_cell_update(normalized_header: str, value: Any):
+            if normalized_header not in header_index:
+                return
+
+            col_index = header_index[normalized_header] + 1
+            col_letter = col_to_letter(col_index)
+            row_updates.append({
+                "range": f"{MASTER_SHEET_NAME}!{col_letter}{next_row_number}",
+                "values": [[value if value is not None else ""]],
+            })
+
+        lead_id = ""
+        if "leadid" in header_index:
+            lead_id = next_lead_id(existing_rows)
+            inserted_item["lead_id"] = lead_id
+            add_cell_update("leadid", lead_id)
+
+        add_cell_update("leadname", lead.lead_name)
+        add_cell_update("company", lead.company or "")
+        add_cell_update("source", normalize_source(lead.source))
+        add_cell_update("stage", lead.stage_status or "")
+        add_cell_update("lasttouchpoint", lead.last_touchpoint_date or "")
+        add_cell_update("followupdate", lead.follow_up_date or "")
+        add_cell_update("notes", build_notes(lead))
 
         if "handoverstatus" in header_index:
-            actual_header = headers[header_index["handoverstatus"]]
-            if row_dict[actual_header] == "":
-                row_dict[actual_header] = "Pending"
+            add_cell_update("handoverstatus", "Pending")
 
         if "missingfields" in header_index and lead.missing_fields_declared:
-            actual_header = headers[header_index["missingfields"]]
-            row_dict[actual_header] = lead.missing_fields_declared
+            add_cell_update("missingfields", lead.missing_fields_declared)
 
-        next_row = DATA_START_ROW + len(existing_rows)
-        last_col = get_last_column_letter(headers)
-        ordered_row = [row_dict.get(header, "") for header in headers]
+        if not row_updates:
+            raise HTTPException(status_code=400, detail="No matching writable columns found in Master Leads")
 
-        service.spreadsheets().values().update(
+        service.spreadsheets().values().batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{MASTER_SHEET_NAME}!A{next_row}:{last_col}{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [ordered_row]},
+            body={
+                "valueInputOption": "USER_ENTERED",
+                "data": row_updates,
+            },
         ).execute()
 
-        if next_row > DATA_START_ROW:
+        if next_row_number > DATA_START_ROW:
             copy_formula_cells(
                 service=service,
                 sheet_name=MASTER_SHEET_NAME,
-                headers=headers,
-                previous_row=next_row - 1,
-                new_row=next_row,
+                headers=sheet_headers,
+                previous_row=next_row_number - 1,
+                new_row=next_row_number,
             )
 
-        inserted_row_values = get_row_values(MASTER_SHEET_NAME, next_row, headers)
+        inserted_row_values = get_row_values(MASTER_SHEET_NAME, next_row_number, sheet_headers)
         inserted_row = {}
-        for idx, header in enumerate(headers):
+
+        for idx, header in enumerate(sheet_headers):
             inserted_row[header] = inserted_row_values[idx] if idx < len(inserted_row_values) else ""
 
         inserted_item = {
-            "row_number": next_row,
-            "lead_id": first_value(inserted_row, ["Lead ID", "Lead_ID"]),
-            "lead_name": first_value(inserted_row, ["Lead Name", "Lead Name ✱", "Lead_Name"]),
-            "company": first_value(inserted_row, ["Company"]),
-            "source": first_value(inserted_row, ["Source", "Source ✱"]),
-            "stage": first_value(inserted_row, ["Stage", "Stage ✱", "Stage_Status"]),
-            "last_touchpoint": first_value(inserted_row, ["Last Touchpoint", "Last Touchpoint ✱"]),
-            "follow_up_date": first_value(inserted_row, ["Follow-up Date", "Follow_Up_Date"]),
-            "notes": first_value(inserted_row, ["Notes"]),
+            "row_number": next_row_number,
+            "lead_id": first_value(inserted_row, ["Lead ID", "Lead_ID"]) or lead_id,
+            "lead_name": first_value(inserted_row, ["Lead Name", "Lead Name ✱", "Lead_Name"]) or lead.lead_name,
+            "company": first_value(inserted_row, ["Company"]) or (lead.company or ""),
+            "source": first_value(inserted_row, ["Source", "Source ✱"]) or normalize_source(lead.source),
+            "stage": first_value(inserted_row, ["Stage", "Stage ✱", "Stage_Status"]) or (lead.stage_status or ""),
+            "last_touchpoint": first_value(inserted_row, ["Last Touchpoint", "Last Touchpoint ✱"]) or (lead.last_touchpoint_date or ""),
+            "follow_up_date": first_value(inserted_row, ["Follow-up Date", "Follow_Up_Date"]) or (lead.follow_up_date or ""),
+            "notes": first_value(inserted_row, ["Notes"]) or build_notes(lead),
         }
 
         inserted.append(inserted_item)
+        inserted_row["_row_number"] = next_row_number
         existing_rows.append(inserted_row)
 
         append_log_entry(
             action_type="APPEND",
             sheet_name=MASTER_SHEET_NAME,
-            target_row_number=next_row,
+            target_row_number=next_row_number,
             lead_id=inserted_item["lead_id"],
             lead_name=inserted_item["lead_name"],
-            changed_fields=["Lead Name", "Company", "Source", "Stage", "Last Touchpoint", "Follow-up Date", "Notes"],
+            changed_fields=["Lead ID", "Lead Name", "Company", "Source", "Stage", "Last Touchpoint", "Follow-up Date", "Notes"],
             old_values="NEW ROW",
             new_values=inserted_item,
             triggered_by="GPT Action",
@@ -1059,13 +1093,13 @@ def update_lead(payload: UpdateLeadRequest, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
 
     service = get_service()
-    headers = get_headers(MASTER_SHEET_NAME)
+    sheet_headers = get_headers(MASTER_SHEET_NAME)
 
-    if not headers:
+    if not sheet_headers:
         raise HTTPException(status_code=404, detail="Master sheet header row not found")
 
     rows = rows_from_sheet(MASTER_SHEET_NAME)
-    header_index = get_header_index_map(headers)
+    header_index = get_header_index_map(sheet_headers)
 
     if "leadid" not in header_index:
         raise HTTPException(status_code=400, detail="Lead ID column not found")
@@ -1094,7 +1128,7 @@ def update_lead(payload: UpdateLeadRequest, x_api_key: str = Header(...)):
         if normalized_key not in header_index:
             continue
 
-        actual_header = headers[header_index[normalized_key]]
+        actual_header = sheet_headers[header_index[normalized_key]]
         current_value = target_row.get(actual_header, "")
 
         if str(current_value) == str(value):
