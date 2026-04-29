@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, date, timedelta
 import os
@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
-app = FastAPI(title="Sales Handoff API", version="7.0.0-no-auto-log")
+app = FastAPI(title="Sales Handoff API", version="8.0.0-stable")
 
 APP_API_KEY = os.getenv("APP_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
@@ -18,7 +18,6 @@ MASTER_SHEET_NAME = os.getenv("MASTER_SHEET_NAME", "Master Leads")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Master Leads layout
 HEADER_ROW = 3
 DATA_START_ROW = 4
 
@@ -31,8 +30,8 @@ def root():
     return {
         "status": "running",
         "message": "Sales Handoff API is live",
-        "version": "7.0.0-no-auto-log",
-        "mode": "Master Leads only by default. No automatic Update Log write.",
+        "version": "8.0.0-stable",
+        "mode": "Master Leads only by default. Review and draft responses are size-safe.",
         "available_endpoints": {
             "health": "GET /",
             "docs": "GET /docs",
@@ -52,7 +51,6 @@ def root():
 def check_api_key(x_api_key: str):
     if not APP_API_KEY:
         raise HTTPException(status_code=500, detail="APP_API_KEY is not configured")
-
     if x_api_key != APP_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -64,7 +62,6 @@ def get_service():
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
-
     info = json.loads(raw)
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds)
@@ -102,17 +99,21 @@ class AppendLeadsRequest(BaseModel):
 
 class GetRowsRequest(BaseModel):
     sheet_name: str
+    max_rows: Optional[int] = Field(default=50, ge=1, le=200)
+    start_offset: Optional[int] = Field(default=0, ge=0)
 
 
 class GetReviewDataRequest(BaseModel):
     period: str = "month"  # today | week | month
-    include_tabs: Optional[List[str]] = None
-    stale_threshold_days: Optional[int] = 30
+    stale_threshold_days: Optional[int] = Field(default=30, ge=1, le=365)
+    max_items_per_group: Optional[int] = Field(default=8, ge=1, le=25)
+    summary_only: Optional[bool] = False
 
 
 class DraftMessageRequest(BaseModel):
-    period: str = "today"  # today | week | month
+    period: str = "month"  # today | week | month
     style: str = "both"  # whatsapp | email | both
+    max_leads: Optional[int] = Field(default=8, ge=1, le=20)
 
 
 class UpdateLeadRequest(BaseModel):
@@ -185,7 +186,6 @@ def rows_from_sheet_generic(sheet_name: str, header_row: int, data_start_row: in
         row_dict["_sheet"] = sheet_name
         row_dict["_row_number"] = data_start_row + offset
         rows.append(row_dict)
-
     return rows
 
 
@@ -214,6 +214,7 @@ def row_to_public_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "lead_name": first_value(row, ["Lead Name", "Lead Name ✱", "Lead_Name"]),
         "company": first_value(row, ["Company"]),
         "source": first_value(row, ["Source", "Source ✱"]),
+        "owner": first_value(row, ["Owner", "Lead Owner"]),
         "stage": first_value(row, ["Stage", "Stage ✱", "Stage_Status"]),
         "last_touchpoint": first_value(row, ["Last Touchpoint", "Last Touchpoint ✱", "Last_Touchpoint_Summary"]),
         "follow_up_date": first_value(row, ["Follow-up Date", "Follow_Up_Date"]),
@@ -222,6 +223,8 @@ def row_to_public_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "handover_status": first_value(row, ["Handover Status"]),
         "outcome": first_value(row, ["Outcome"]),
         "reason_for_outcome": first_value(row, ["Reason for Outcome"]),
+        "handover_gate": first_value(row, ["✔ Handover Gate", "Handover Gate"]),
+        "feedback_alert": first_value(row, ["Feedback Alert"]),
     }
 
 
@@ -283,6 +286,7 @@ def parse_date_safe(value: str) -> Optional[date]:
 
 def period_range(period: str) -> Tuple[date, date]:
     today = date.today()
+    period = (period or "month").lower()
 
     if period == "today":
         return today, today
@@ -413,44 +417,42 @@ def classify_row(row: Dict[str, Any], stale_threshold_days: int = 30) -> str:
     return "Ready for Handoff"
 
 
+def breakdown(rows: List[Dict[str, Any]], field: str, top_n: int = 20) -> List[Dict[str, Any]]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        public = row_to_public_dict(row)
+        key = public.get(field) or "Unknown"
+        counts[key] = counts.get(key, 0) + 1
+    ordered = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    return [{"name": name, "count": count} for name, count in ordered]
+
+
 def summarise_row(row: Dict[str, Any], classification: str) -> Dict[str, Any]:
     public = row_to_public_dict(row)
     public["sheet"] = row.get("_sheet", "")
     public["classification"] = classification
-    public["handover_gate"] = first_value(row, ["✔ Handover Gate", "Handover Gate"])
-    public["feedback_alert"] = first_value(row, ["Feedback Alert"])
     return public
 
 
-def build_review_data(period: str, include_tabs: Optional[List[str]], stale_threshold_days: int) -> Dict[str, Any]:
-    include_tabs = include_tabs or [
-        MASTER_SHEET_NAME,
-        "Pending Feedback",
-        "Stale Leads",
-        "Learning Log",
-    ]
+def cap_items(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    return items[: max(1, min(limit, 25))]
 
+
+def build_review_data(
+    period: str,
+    stale_threshold_days: int,
+    max_items_per_group: int,
+    summary_only: bool,
+) -> Dict[str, Any]:
     start_date, end_date = period_range(period)
+    all_master_rows = rows_from_sheet(MASTER_SHEET_NAME)
 
-    all_rows = []
-    available_tabs = []
-    missing_tabs = []
-
-    for tab in include_tabs:
-        try:
-            tab_rows = rows_from_sheet(tab)
-            available_tabs.append(tab)
-            all_rows.extend(tab_rows)
-        except Exception:
-            missing_tabs.append(tab)
-
-    master_rows = [row for row in all_rows if row.get("_sheet") == MASTER_SHEET_NAME]
-
-    relevant_rows = [row for row in master_rows if is_in_period(row, start_date, end_date)]
+    relevant_rows = [row for row in all_master_rows if is_in_period(row, start_date, end_date)]
 
     used_fallback = False
-    if not relevant_rows and master_rows:
-        relevant_rows = master_rows
+    if not relevant_rows:
+        # Size-safe fallback: classify all rows, but return only capped examples.
+        relevant_rows = all_master_rows
         used_fallback = True
 
     ready = []
@@ -474,31 +476,42 @@ def build_review_data(period: str, include_tabs: Optional[List[str]], stale_thre
         elif classification == "Learning Signal Only":
             learning_signals.append(item)
 
-    learning_log_rows = [row for row in all_rows if row.get("_sheet") == "Learning Log"]
-    recent_learning = [row for row in learning_log_rows if is_in_period(row, start_date, end_date)]
+    summary = {
+        "total_considered_count": len(relevant_rows),
+        "ready_for_handoff_count": len(ready),
+        "blocked_count": len(blocked),
+        "stale_count": len(stale),
+        "pending_feedback_count": len(pending_feedback),
+        "learning_signal_count": len(learning_signals),
+        "returned_per_group_limit": max_items_per_group,
+        "stage_breakdown": breakdown(relevant_rows, "stage"),
+        "source_breakdown": breakdown(relevant_rows, "source"),
+        "owner_breakdown": breakdown(relevant_rows, "owner"),
+    }
 
-    return {
+    response = {
         "period": period,
         "start_date": str(start_date),
         "end_date": str(end_date),
         "used_fallback_master_leads_without_strict_period_filter": used_fallback,
-        "available_tabs": available_tabs,
-        "missing_tabs": missing_tabs,
-        "summary": {
-            "ready_for_handoff_count": len(ready),
-            "blocked_count": len(blocked),
-            "stale_count": len(stale),
-            "pending_feedback_count": len(pending_feedback),
-            "learning_signal_count": len(learning_signals),
-            "recent_learning_log_count": len(recent_learning),
+        "available_tabs": [MASTER_SHEET_NAME],
+        "missing_tabs": [],
+        "summary": summary,
+        "truncated": {
+            "ready_for_handoff": len(ready) > max_items_per_group,
+            "blocked": len(blocked) > max_items_per_group,
+            "stale": len(stale) > max_items_per_group,
+            "pending_feedback": len(pending_feedback) > max_items_per_group,
+            "learning_signals": len(learning_signals) > max_items_per_group,
         },
-        "ready_for_handoff": ready,
-        "blocked": blocked,
-        "stale": stale,
-        "pending_feedback": pending_feedback,
-        "learning_signals": learning_signals,
-        "recent_learning_log_rows": recent_learning,
+        "ready_for_handoff": [] if summary_only else cap_items(ready, max_items_per_group),
+        "blocked": [] if summary_only else cap_items(blocked, max_items_per_group),
+        "stale": [] if summary_only else cap_items(stale, max_items_per_group),
+        "pending_feedback": [] if summary_only else cap_items(pending_feedback, max_items_per_group),
+        "learning_signals": [] if summary_only else cap_items(learning_signals, max_items_per_group),
     }
+
+    return response
 
 
 # -----------------------------
@@ -632,41 +645,41 @@ def format_lead_line(lead: Dict[str, Any]) -> str:
     return f"{name} — {company} — {stage} — Follow-up: {follow_up}"
 
 
-def build_whatsapp_draft(review_data: Dict[str, Any]) -> str:
+def build_whatsapp_draft(review_data: Dict[str, Any], max_leads: int) -> str:
     ready = review_data.get("ready_for_handoff", [])
     blocked = review_data.get("blocked", [])
     stale = review_data.get("stale", [])
     pending = review_data.get("pending_feedback", [])
+    summary = review_data.get("summary", {})
 
     lines = [
         f"Sales Handoff Review — {review_data.get('period', '').title()}",
-        "",
-        f"Ready: {len(ready)} | Blocked: {len(blocked)} | Stale: {len(stale)} | Pending Feedback: {len(pending)}",
+        f"Ready: {summary.get('ready_for_handoff_count', 0)} | Blocked: {summary.get('blocked_count', 0)} | Stale: {summary.get('stale_count', 0)} | Pending: {summary.get('pending_feedback_count', 0)}",
     ]
 
     if ready:
         lines.append("")
         lines.append("Ready for action:")
-        for lead in ready[:8]:
+        for lead in ready[:max_leads]:
             lines.append(f"- {format_lead_line(lead)}")
 
     if blocked:
         lines.append("")
         lines.append("Blocked / missing info:")
-        for lead in blocked[:5]:
-            missing = lead.get("missing_fields") or "Required fields need review"
-            lines.append(f"- {lead.get('lead_name') or 'Unnamed lead'} — {missing}")
+        for lead in blocked[:min(5, max_leads)]:
+            lines.append(f"- {lead.get('lead_name') or 'Unnamed lead'} — {lead.get('missing_fields') or 'Needs required field review'}")
 
     if stale:
         lines.append("")
         lines.append("Stale / re-engagement:")
-        for lead in stale[:5]:
+        for lead in stale[:min(5, max_leads)]:
             lines.append(f"- {format_lead_line(lead)}")
 
     return "\n".join(lines)
 
 
-def build_email_draft(review_data: Dict[str, Any]) -> str:
+def build_email_draft(review_data: Dict[str, Any], max_leads: int) -> str:
+    summary = review_data.get("summary", {})
     ready = review_data.get("ready_for_handoff", [])
     blocked = review_data.get("blocked", [])
     stale = review_data.get("stale", [])
@@ -682,16 +695,17 @@ def build_email_draft(review_data: Dict[str, Any]) -> str:
         f"Sharing the {review_data.get('period', '')} sales handoff review.",
         "",
         "Summary:",
-        f"- Ready for Handoff: {len(ready)}",
-        f"- Blocked / Missing Information: {len(blocked)}",
-        f"- Stale / Re-engagement Needed: {len(stale)}",
-        f"- Awaiting Feedback: {len(pending)}",
+        f"- Total considered: {summary.get('total_considered_count', 0)}",
+        f"- Ready for Handoff: {summary.get('ready_for_handoff_count', 0)}",
+        f"- Blocked / Missing Information: {summary.get('blocked_count', 0)}",
+        f"- Stale / Re-engagement Needed: {summary.get('stale_count', 0)}",
+        f"- Awaiting Feedback: {summary.get('pending_feedback_count', 0)}",
         "",
     ]
 
     if ready:
         lines.append("Ready for Handoff:")
-        for lead in ready:
+        for lead in ready[:max_leads]:
             lines.append(f"- {format_lead_line(lead)}")
             if lead.get("notes"):
                 lines.append(f"  Notes: {lead.get('notes')}")
@@ -699,21 +713,25 @@ def build_email_draft(review_data: Dict[str, Any]) -> str:
 
     if blocked:
         lines.append("Blocked / Missing Information:")
-        for lead in blocked:
+        for lead in blocked[:max_leads]:
             missing = lead.get("missing_fields") or "Required fields need review"
             lines.append(f"- {lead.get('lead_name') or 'Unnamed lead'} — {missing}")
         lines.append("")
 
     if stale:
         lines.append("Stale / Re-engagement Needed:")
-        for lead in stale:
+        for lead in stale[:max_leads]:
             lines.append(f"- {format_lead_line(lead)}")
         lines.append("")
 
     if pending:
         lines.append("Awaiting Feedback:")
-        for lead in pending:
+        for lead in pending[:max_leads]:
             lines.append(f"- {format_lead_line(lead)}")
+        lines.append("")
+
+    if review_data.get("used_fallback_master_leads_without_strict_period_filter"):
+        lines.append("Note: The backend used Master Leads fallback because no strict period-matched rows were found.")
         lines.append("")
 
     lines.extend([
@@ -791,6 +809,7 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
         add_cell_update("leadname", lead.lead_name)
         add_cell_update("company", lead.company or "")
         add_cell_update("source", normalize_source(lead.source))
+        add_cell_update("owner", lead.owner or "")
         add_cell_update("stage", lead.stage_status or "")
         add_cell_update("lasttouchpoint", lead.last_touchpoint_date or "")
         add_cell_update("followupdate", lead.follow_up_date or "")
@@ -863,10 +882,17 @@ def get_rows(payload: GetRowsRequest, x_api_key: str = Header(...)):
 
     rows = rows_from_sheet(payload.sheet_name)
 
+    start = payload.start_offset or 0
+    max_rows = payload.max_rows or 50
+    sliced = rows[start:start + max_rows]
+
     return {
         "sheet_name": payload.sheet_name,
         "row_count": len(rows),
-        "rows": rows,
+        "returned_count": len(sliced),
+        "start_offset": start,
+        "max_rows": max_rows,
+        "rows": sliced,
     }
 
 
@@ -876,8 +902,9 @@ def get_review_data(payload: GetReviewDataRequest, x_api_key: str = Header(...))
 
     return build_review_data(
         period=payload.period,
-        include_tabs=payload.include_tabs,
         stale_threshold_days=payload.stale_threshold_days or 30,
+        max_items_per_group=payload.max_items_per_group or 8,
+        summary_only=payload.summary_only or False,
     )
 
 
@@ -885,10 +912,13 @@ def get_review_data(payload: GetReviewDataRequest, x_api_key: str = Header(...))
 def draft_message(payload: DraftMessageRequest, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
 
+    max_leads = payload.max_leads or 8
+
     review_data = build_review_data(
         period=payload.period,
-        include_tabs=None,
         stale_threshold_days=30,
+        max_items_per_group=max_leads,
+        summary_only=False,
     )
 
     result = {
@@ -897,10 +927,10 @@ def draft_message(payload: DraftMessageRequest, x_api_key: str = Header(...)):
     }
 
     if payload.style in ["whatsapp", "both"]:
-        result["whatsapp"] = build_whatsapp_draft(review_data)
+        result["whatsapp"] = build_whatsapp_draft(review_data, max_leads=max_leads)
 
     if payload.style in ["email", "both"]:
-        result["email"] = build_email_draft(review_data)
+        result["email"] = build_email_draft(review_data, max_leads=max_leads)
 
     return result
 
@@ -932,7 +962,6 @@ def update_lead(payload: UpdateLeadRequest, x_api_key: str = Header(...)):
         raise HTTPException(status_code=404, detail="Lead ID not found")
 
     target_row_number = target_row["_row_number"]
-
     old_values = {}
     new_values = {}
     changed_fields = []
