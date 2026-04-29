@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
-app = FastAPI(title="Sales Handoff API", version="6.2.0")
+app = FastAPI(title="Sales Handoff API", version="6.3.0")
 
 APP_API_KEY = os.getenv("APP_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
@@ -51,7 +51,7 @@ def root():
     return {
         "status": "running",
         "message": "Sales Handoff API is live",
-        "version": "6.2.0",
+        "version": "6.3.0",
         "available_endpoints": {
             "health": "GET /",
             "docs": "GET /docs",
@@ -61,6 +61,7 @@ def root():
             "review_data": "POST /get-review-data",
             "draft_message": "POST /draft-message",
             "update_lead": "POST /update-lead",
+            "log_health": "GET /log-health",
         },
     }
 
@@ -118,9 +119,7 @@ def ensure_sheet_exists(sheet_name: str):
                 "requests": [
                     {
                         "addSheet": {
-                            "properties": {
-                                "title": sheet_name
-                            }
+                            "properties": {"title": sheet_name}
                         }
                     }
                 ]
@@ -221,7 +220,6 @@ def get_row_values(
         range=f"{sheet_name}!A{row_number}:{last_col}{row_number}",
         valueRenderOption=value_render_option,
     ).execute()
-
     values = result.get("values", [])
     return values[0] if values else []
 
@@ -748,12 +746,13 @@ def append_log_entry(
     source_input_type: str = "mixed input",
     status: str = "SUCCESS",
     remarks: str = "",
-):
+) -> Dict[str, Any]:
     try:
         ensure_log_sheet_headers()
 
+        log_id = next_log_id()
         row = [
-            next_log_id(),
+            log_id,
             datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
             action_type,
             sheet_name,
@@ -776,8 +775,12 @@ def append_log_entry(
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
         ).execute()
+
+        return {"ok": True, "log_id": log_id, "error": ""}
     except Exception as exc:
-        print("LOG ERROR:", str(exc))
+        error_message = str(exc)
+        print("LOG ERROR:", error_message)
+        return {"ok": False, "log_id": "", "error": error_message}
 
 
 # -----------------------------
@@ -911,6 +914,30 @@ def sheet_schema(x_api_key: str = Header(...)):
     }
 
 
+@app.get("/log-health")
+def log_health(x_api_key: str = Header(...)):
+    check_api_key(x_api_key)
+
+    result = {
+        "log_sheet_name": LOG_SHEET_NAME,
+        "exists_or_created": False,
+        "headers_ok": False,
+        "row_count": 0,
+        "error": "",
+    }
+
+    try:
+        ensure_log_sheet_headers()
+        values = get_values(LOG_SHEET_NAME)
+        result["exists_or_created"] = True
+        result["headers_ok"] = bool(values and len(values[0]) >= len(LOG_HEADERS))
+        result["row_count"] = max(len(values) - 1, 0)
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+
 @app.post("/append-leads")
 def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
@@ -926,21 +953,11 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
     existing_rows = rows_from_sheet(MASTER_SHEET_NAME)
 
     inserted = []
+    warnings = []
 
     for lead in payload.leads:
         next_row_number = find_next_empty_master_row(existing_rows)
         row_updates = []
-        inserted_item = {
-            "row_number": next_row_number,
-            "lead_id": "",
-            "lead_name": lead.lead_name,
-            "company": lead.company or "",
-            "source": normalize_source(lead.source),
-            "stage": lead.stage_status or "",
-            "last_touchpoint": lead.last_touchpoint_date or "",
-            "follow_up_date": lead.follow_up_date or "",
-            "notes": build_notes(lead),
-        }
 
         def add_cell_update(normalized_header: str, value: Any):
             if normalized_header not in header_index:
@@ -956,7 +973,6 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
         lead_id = ""
         if "leadid" in header_index:
             lead_id = next_lead_id(existing_rows)
-            inserted_item["lead_id"] = lead_id
             add_cell_update("leadid", lead_id)
 
         add_cell_update("leadname", lead.lead_name)
@@ -993,11 +1009,15 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
                 new_row=next_row_number,
             )
 
-        inserted_row_values = get_row_values(MASTER_SHEET_NAME, next_row_number, sheet_headers)
-        inserted_row = {}
-
-        for idx, header in enumerate(sheet_headers):
-            inserted_row[header] = inserted_row_values[idx] if idx < len(inserted_row_values) else ""
+        try:
+            inserted_row_values = get_row_values(MASTER_SHEET_NAME, next_row_number, sheet_headers)
+            inserted_row = {
+                header: inserted_row_values[idx] if idx < len(inserted_row_values) else ""
+                for idx, header in enumerate(sheet_headers)
+            }
+        except Exception as exc:
+            warnings.append(f"Read-back failed for row {next_row_number}: {str(exc)}")
+            inserted_row = {}
 
         inserted_item = {
             "row_number": next_row_number,
@@ -1012,10 +1032,15 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
         }
 
         inserted.append(inserted_item)
-        inserted_row["_row_number"] = next_row_number
-        existing_rows.append(inserted_row)
 
-        append_log_entry(
+        if inserted_row:
+            inserted_row["_row_number"] = next_row_number
+            existing_rows.append(inserted_row)
+        else:
+            fallback_row = {"_row_number": next_row_number, "Lead ID": lead_id, "Lead Name": lead.lead_name}
+            existing_rows.append(fallback_row)
+
+        log_result = append_log_entry(
             action_type="APPEND",
             sheet_name=MASTER_SHEET_NAME,
             target_row_number=next_row_number,
@@ -1030,10 +1055,17 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
             remarks="Lead appended to Master Leads",
         )
 
+        inserted_item["log_status"] = "logged" if log_result.get("ok") else "log_failed"
+        inserted_item["log_id"] = log_result.get("log_id", "")
+
+        if not log_result.get("ok"):
+            warnings.append(f"Update Log failed for {inserted_item['lead_name']}: {log_result.get('error', '')}")
+
     return {
         "status": "success",
         "rows_added": len(inserted),
         "inserted": inserted,
+        "warnings": warnings,
     }
 
 
@@ -1161,7 +1193,7 @@ def update_lead(payload: UpdateLeadRequest, x_api_key: str = Header(...)):
         },
     ).execute()
 
-    append_log_entry(
+    log_result = append_log_entry(
         action_type="UPDATE",
         sheet_name=MASTER_SHEET_NAME,
         target_row_number=target_row_number,
@@ -1182,4 +1214,7 @@ def update_lead(payload: UpdateLeadRequest, x_api_key: str = Header(...)):
         "lead_id": payload.lead_id,
         "row_number": target_row_number,
         "changed_fields": changed_fields,
+        "log_status": "logged" if log_result.get("ok") else "log_failed",
+        "log_id": log_result.get("log_id", ""),
+        "log_error": log_result.get("error", ""),
     }
