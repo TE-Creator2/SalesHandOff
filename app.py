@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
-app = FastAPI(title="Sales Handoff API", version="8.0.0-stable")
+app = FastAPI(title="Sales Handoff API", version="9.0.0-all-tasks-stable")
 
 APP_API_KEY = os.getenv("APP_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
@@ -18,8 +18,20 @@ MASTER_SHEET_NAME = os.getenv("MASTER_SHEET_NAME", "Master Leads")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Master Leads layout
 HEADER_ROW = 3
 DATA_START_ROW = 4
+
+# Candidate timestamp columns used for insertion review.
+# The first matching header found in Master Leads will be written during append.
+INSERTION_TIMESTAMP_HEADERS = [
+    "Inserted At",
+    "Created At",
+    "Added At",
+    "Entry Timestamp",
+    "Data Inserted At",
+    "Handover Generated",
+]
 
 
 # -----------------------------
@@ -30,8 +42,8 @@ def root():
     return {
         "status": "running",
         "message": "Sales Handoff API is live",
-        "version": "8.0.0-stable",
-        "mode": "Master Leads only by default. Review and draft responses are size-safe.",
+        "version": "9.0.0-all-tasks-stable",
+        "mode": "Master Leads only by default. Supports insertion, daily review, weekly review, monthly review, insertion review with time, and message drafting.",
         "available_endpoints": {
             "health": "GET /",
             "docs": "GET /docs",
@@ -39,6 +51,7 @@ def root():
             "append_leads": "POST /append-leads",
             "get_rows": "POST /get-rows",
             "review_data": "POST /get-review-data",
+            "insertion_review": "POST /get-insertion-review",
             "draft_message": "POST /draft-message",
             "update_lead": "POST /update-lead",
         },
@@ -110,9 +123,15 @@ class GetReviewDataRequest(BaseModel):
     summary_only: Optional[bool] = False
 
 
+class GetInsertionReviewRequest(BaseModel):
+    period: str = "today"  # today | week | month
+    max_items: Optional[int] = Field(default=25, ge=1, le=100)
+
+
 class DraftMessageRequest(BaseModel):
     period: str = "month"  # today | week | month
     style: str = "both"  # whatsapp | email | both
+    purpose: str = "review"  # review | insertion_review | all
     max_leads: Optional[int] = Field(default=8, ge=1, le=20)
 
 
@@ -207,7 +226,16 @@ def first_value(row: Dict[str, Any], candidates: List[str]) -> str:
     return ""
 
 
+def find_header_key(header_index: Dict[str, int], candidates: List[str]) -> Optional[str]:
+    for candidate in candidates:
+        key = normalize_header(candidate)
+        if key in header_index:
+            return key
+    return None
+
+
 def row_to_public_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    inserted_at = first_value(row, INSERTION_TIMESTAMP_HEADERS)
     return {
         "row_number": row.get("_row_number"),
         "lead_id": first_value(row, ["Lead ID", "Lead_ID"]),
@@ -222,9 +250,11 @@ def row_to_public_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "missing_fields": first_value(row, ["Missing Fields", "Missing_Fields_Declared"]),
         "handover_status": first_value(row, ["Handover Status"]),
         "outcome": first_value(row, ["Outcome"]),
+        "outcome_date": first_value(row, ["Outcome Date"]),
         "reason_for_outcome": first_value(row, ["Reason for Outcome"]),
         "handover_gate": first_value(row, ["✔ Handover Gate", "Handover Gate"]),
         "feedback_alert": first_value(row, ["Feedback Alert"]),
+        "inserted_at": inserted_at,
     }
 
 
@@ -328,11 +358,23 @@ def row_activity_date(row: Dict[str, Any]) -> Optional[date]:
     return None
 
 
+def row_insertion_date(row: Dict[str, Any]) -> Optional[date]:
+    inserted_at = first_value(row, INSERTION_TIMESTAMP_HEADERS)
+    return parse_date_safe(inserted_at)
+
+
 def is_in_period(row: Dict[str, Any], start_date: date, end_date: date) -> bool:
     activity_date = row_activity_date(row)
     if not activity_date:
         return False
     return start_date <= activity_date <= end_date
+
+
+def is_inserted_in_period(row: Dict[str, Any], start_date: date, end_date: date) -> bool:
+    inserted_date = row_insertion_date(row)
+    if not inserted_date:
+        return False
+    return start_date <= inserted_date <= end_date
 
 
 def gate_positive(gate_value: str) -> bool:
@@ -451,7 +493,6 @@ def build_review_data(
 
     used_fallback = False
     if not relevant_rows:
-        # Size-safe fallback: classify all rows, but return only capped examples.
         relevant_rows = all_master_rows
         used_fallback = True
 
@@ -489,7 +530,7 @@ def build_review_data(
         "owner_breakdown": breakdown(relevant_rows, "owner"),
     }
 
-    response = {
+    return {
         "period": period,
         "start_date": str(start_date),
         "end_date": str(end_date),
@@ -511,7 +552,29 @@ def build_review_data(
         "learning_signals": [] if summary_only else cap_items(learning_signals, max_items_per_group),
     }
 
-    return response
+
+def build_insertion_review_data(period: str, max_items: int) -> Dict[str, Any]:
+    start_date, end_date = period_range(period)
+    all_master_rows = rows_from_sheet(MASTER_SHEET_NAME)
+
+    timestamped_rows = [row for row in all_master_rows if row_insertion_date(row)]
+    inserted_rows = [row for row in timestamped_rows if is_inserted_in_period(row, start_date, end_date)]
+
+    items = [row_to_public_dict(row) for row in inserted_rows]
+    items = sorted(items, key=lambda x: str(x.get("inserted_at", "")), reverse=True)
+
+    return {
+        "period": period,
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "timestamp_columns_supported": INSERTION_TIMESTAMP_HEADERS,
+        "total_rows_with_insert_timestamp": len(timestamped_rows),
+        "inserted_count": len(items),
+        "returned_count": min(len(items), max_items),
+        "truncated": len(items) > max_items,
+        "inserted_leads": items[:max_items],
+        "note": "Insertion review uses timestamp columns in Master Leads. If no timestamp column exists, add one such as Inserted At or Created At.",
+    }
 
 
 # -----------------------------
@@ -590,8 +653,7 @@ def build_notes(lead: LeadRecord) -> str:
 
 def copy_formula_cells(service, sheet_name: str, headers: List[str], previous_row: int, new_row: int):
     """
-    Optional helper. Non-blocking.
-    Copies formulas only if allowed. Failure here must never break insertion.
+    Non-blocking formula helper. Failure must never break insertion.
     """
     try:
         formula_headers = [
@@ -645,7 +707,7 @@ def format_lead_line(lead: Dict[str, Any]) -> str:
     return f"{name} — {company} — {stage} — Follow-up: {follow_up}"
 
 
-def build_whatsapp_draft(review_data: Dict[str, Any], max_leads: int) -> str:
+def build_whatsapp_review_draft(review_data: Dict[str, Any], max_leads: int) -> str:
     ready = review_data.get("ready_for_handoff", [])
     blocked = review_data.get("blocked", [])
     stale = review_data.get("stale", [])
@@ -678,7 +740,7 @@ def build_whatsapp_draft(review_data: Dict[str, Any], max_leads: int) -> str:
     return "\n".join(lines)
 
 
-def build_email_draft(review_data: Dict[str, Any], max_leads: int) -> str:
+def build_email_review_draft(review_data: Dict[str, Any], max_leads: int) -> str:
     summary = review_data.get("summary", {})
     ready = review_data.get("ready_for_handoff", [])
     blocked = review_data.get("blocked", [])
@@ -745,6 +807,57 @@ def build_email_draft(review_data: Dict[str, Any], max_leads: int) -> str:
     return "\n".join(lines)
 
 
+def build_whatsapp_insertion_draft(insertion_data: Dict[str, Any], max_leads: int) -> str:
+    items = insertion_data.get("inserted_leads", [])
+    lines = [
+        f"Sales Sheet Insertion Review — {insertion_data.get('period', '').title()}",
+        f"Inserted: {insertion_data.get('inserted_count', 0)} | Returned: {insertion_data.get('returned_count', 0)}",
+    ]
+    if items:
+        lines.append("")
+        lines.append("Inserted leads:")
+        for lead in items[:max_leads]:
+            inserted_at = lead.get("inserted_at") or "time not captured"
+            lines.append(f"- {lead.get('lead_name') or 'Unnamed lead'} — {lead.get('company') or 'Company not specified'} — Inserted: {inserted_at}")
+    else:
+        lines.append("")
+        lines.append("No inserted leads found for this period based on available timestamp columns.")
+    return "\n".join(lines)
+
+
+def build_email_insertion_draft(insertion_data: Dict[str, Any], max_leads: int) -> str:
+    items = insertion_data.get("inserted_leads", [])
+    lines = [
+        f"Subject: Sales Sheet Insertion Review — {insertion_data.get('period', '').title()}",
+        "",
+        "Hi Team,",
+        "",
+        f"Sharing the sales sheet insertion review for {insertion_data.get('period', '')}.",
+        "",
+        "Summary:",
+        f"- Inserted leads found: {insertion_data.get('inserted_count', 0)}",
+        f"- Rows with insertion timestamp: {insertion_data.get('total_rows_with_insert_timestamp', 0)}",
+        "",
+    ]
+    if items:
+        lines.append("Inserted Leads:")
+        for lead in items[:max_leads]:
+            lines.append(f"- {lead.get('lead_name') or 'Unnamed lead'} — {lead.get('company') or 'Company not specified'} — Inserted: {lead.get('inserted_at') or 'time not captured'}")
+        lines.append("")
+    else:
+        lines.append("No inserted leads were found for the selected period based on available timestamp columns.")
+        lines.append("")
+
+    lines.extend([
+        "Recommended next action:",
+        "Please review newly inserted records for completeness and follow-up readiness.",
+        "",
+        "Best,",
+        "[Your Name]",
+    ])
+    return "\n".join(lines)
+
+
 # -----------------------------
 # Endpoints
 # -----------------------------
@@ -767,6 +880,7 @@ def sheet_schema(x_api_key: str = Header(...)):
         "header_row": HEADER_ROW,
         "data_start_row": DATA_START_ROW,
         "columns": sheet_headers,
+        "insertion_timestamp_headers_supported": INSERTION_TIMESTAMP_HEADERS,
     }
 
 
@@ -787,16 +901,20 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
     inserted = []
     warnings = []
 
+    timestamp_key = find_header_key(header_index, INSERTION_TIMESTAMP_HEADERS)
+    inserted_at_value = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
     for lead in payload.leads:
         next_row_number = find_next_empty_master_row(existing_rows)
-        row_updates = []
+        required_updates = []
+        optional_updates = []
 
-        def add_cell_update(normalized_header: str, value: Any):
+        def add_update(update_list: List[Dict[str, Any]], normalized_header: str, value: Any):
             if normalized_header not in header_index:
                 return
             col_index = header_index[normalized_header] + 1
             col_letter = col_to_letter(col_index)
-            row_updates.append({
+            update_list.append({
                 "range": f"{MASTER_SHEET_NAME}!{col_letter}{next_row_number}",
                 "values": [[value if value is not None else ""]],
             })
@@ -804,30 +922,43 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
         lead_id = ""
         if "leadid" in header_index:
             lead_id = next_lead_id(existing_rows)
-            add_cell_update("leadid", lead_id)
+            add_update(optional_updates, "leadid", lead_id)
 
-        add_cell_update("leadname", lead.lead_name)
-        add_cell_update("company", lead.company or "")
-        add_cell_update("source", normalize_source(lead.source))
-        add_cell_update("owner", lead.owner or "")
-        add_cell_update("stage", lead.stage_status or "")
-        add_cell_update("lasttouchpoint", lead.last_touchpoint_date or "")
-        add_cell_update("followupdate", lead.follow_up_date or "")
-        add_cell_update("notes", build_notes(lead))
+        add_update(required_updates, "leadname", lead.lead_name)
+        add_update(required_updates, "company", lead.company or "")
+        add_update(required_updates, "source", normalize_source(lead.source))
+        add_update(required_updates, "owner", lead.owner or "")
+        add_update(required_updates, "stage", lead.stage_status or "")
+        add_update(required_updates, "lasttouchpoint", lead.last_touchpoint_date or "")
+        add_update(required_updates, "followupdate", lead.follow_up_date or "")
+        add_update(required_updates, "notes", build_notes(lead))
 
         if "handoverstatus" in header_index:
-            add_cell_update("handoverstatus", "Pending")
+            add_update(optional_updates, "handoverstatus", "Pending")
 
         if "missingfields" in header_index and lead.missing_fields_declared:
-            add_cell_update("missingfields", lead.missing_fields_declared)
+            add_update(optional_updates, "missingfields", lead.missing_fields_declared)
 
-        if not row_updates:
+        if timestamp_key:
+            add_update(optional_updates, timestamp_key, inserted_at_value)
+
+        if not required_updates and not optional_updates:
             raise HTTPException(status_code=400, detail="No matching writable columns found in Master Leads")
 
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={"valueInputOption": "USER_ENTERED", "data": row_updates},
-        ).execute()
+        if required_updates:
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": required_updates},
+            ).execute()
+
+        if optional_updates:
+            try:
+                service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body={"valueInputOption": "USER_ENTERED", "data": optional_updates},
+                ).execute()
+            except Exception as exc:
+                warnings.append(f"Optional fields not written for row {next_row_number}: {str(exc)}")
 
         if next_row_number > DATA_START_ROW:
             copy_formula_cells(
@@ -854,10 +985,12 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
             "lead_name": first_value(inserted_row, ["Lead Name", "Lead Name ✱", "Lead_Name"]) or lead.lead_name,
             "company": first_value(inserted_row, ["Company"]) or (lead.company or ""),
             "source": first_value(inserted_row, ["Source", "Source ✱"]) or normalize_source(lead.source),
+            "owner": first_value(inserted_row, ["Owner", "Lead Owner"]) or (lead.owner or ""),
             "stage": first_value(inserted_row, ["Stage", "Stage ✱", "Stage_Status"]) or (lead.stage_status or ""),
             "last_touchpoint": first_value(inserted_row, ["Last Touchpoint", "Last Touchpoint ✱"]) or (lead.last_touchpoint_date or ""),
             "follow_up_date": first_value(inserted_row, ["Follow-up Date", "Follow_Up_Date"]) or (lead.follow_up_date or ""),
             "notes": first_value(inserted_row, ["Notes"]) or build_notes(lead),
+            "inserted_at": first_value(inserted_row, INSERTION_TIMESTAMP_HEADERS) or (inserted_at_value if timestamp_key else ""),
         }
 
         inserted.append(inserted_item)
@@ -873,6 +1006,8 @@ def append_leads(payload: AppendLeadsRequest, x_api_key: str = Header(...)):
         "rows_added": len(inserted),
         "inserted": inserted,
         "warnings": warnings,
+        "timestamp_column_used": sheet_headers[header_index[timestamp_key]] if timestamp_key else "",
+        "note": "Normal insertion writes to Master Leads only. No automatic Update Log write is performed.",
     }
 
 
@@ -881,7 +1016,6 @@ def get_rows(payload: GetRowsRequest, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
 
     rows = rows_from_sheet(payload.sheet_name)
-
     start = payload.start_offset or 0
     max_rows = payload.max_rows or 50
     sliced = rows[start:start + max_rows]
@@ -908,29 +1042,55 @@ def get_review_data(payload: GetReviewDataRequest, x_api_key: str = Header(...))
     )
 
 
+@app.post("/get-insertion-review")
+def get_insertion_review(payload: GetInsertionReviewRequest, x_api_key: str = Header(...)):
+    check_api_key(x_api_key)
+
+    return build_insertion_review_data(
+        period=payload.period,
+        max_items=payload.max_items or 25,
+    )
+
+
 @app.post("/draft-message")
 def draft_message(payload: DraftMessageRequest, x_api_key: str = Header(...)):
     check_api_key(x_api_key)
 
     max_leads = payload.max_leads or 8
-
-    review_data = build_review_data(
-        period=payload.period,
-        stale_threshold_days=30,
-        max_items_per_group=max_leads,
-        summary_only=False,
-    )
+    purpose = (payload.purpose or "review").lower()
 
     result = {
         "period": payload.period,
-        "summary": review_data.get("summary", {}),
+        "purpose": purpose,
     }
 
-    if payload.style in ["whatsapp", "both"]:
-        result["whatsapp"] = build_whatsapp_draft(review_data, max_leads=max_leads)
+    if purpose in ["review", "all"]:
+        review_data = build_review_data(
+            period=payload.period,
+            stale_threshold_days=30,
+            max_items_per_group=max_leads,
+            summary_only=False,
+        )
+        result["review_summary"] = review_data.get("summary", {})
+        if payload.style in ["whatsapp", "both"]:
+            result["whatsapp_review"] = build_whatsapp_review_draft(review_data, max_leads=max_leads)
+        if payload.style in ["email", "both"]:
+            result["email_review"] = build_email_review_draft(review_data, max_leads=max_leads)
 
-    if payload.style in ["email", "both"]:
-        result["email"] = build_email_draft(review_data, max_leads=max_leads)
+    if purpose in ["insertion_review", "all"]:
+        insertion_data = build_insertion_review_data(
+            period=payload.period,
+            max_items=max_leads,
+        )
+        result["insertion_summary"] = {
+            "inserted_count": insertion_data.get("inserted_count", 0),
+            "returned_count": insertion_data.get("returned_count", 0),
+            "total_rows_with_insert_timestamp": insertion_data.get("total_rows_with_insert_timestamp", 0),
+        }
+        if payload.style in ["whatsapp", "both"]:
+            result["whatsapp_insertion_review"] = build_whatsapp_insertion_draft(insertion_data, max_leads=max_leads)
+        if payload.style in ["email", "both"]:
+            result["email_insertion_review"] = build_email_insertion_draft(insertion_data, max_leads=max_leads)
 
     return result
 
